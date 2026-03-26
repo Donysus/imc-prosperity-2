@@ -1,179 +1,133 @@
 import json
-from datamodel import Order, OrderDepth, Symbol, TradingState
+from collections import deque
+
+from datamodel import Order, Symbol, TradingState
 
 
 class Trader:
     def __init__(self) -> None:
-        self.limits: dict[str, int] = {
-            "EMERALD": 20,
-            "TOMATO": 20,
+        # Best on tutorial backtest data:
+        # window=20, buy_offset=2, sell_offset=3, limit=20.
+        self.params = {
+            "TOMATOES": {
+                "window": 20,
+                "buy_offset": 2,
+                "sell_offset": 3,
+                "limit": 20,
+                "inventory_skew": 0.08,
+                "close_flatten_ts": 195000,
+            },
+            "EMERALDS": {
+                "window": 20,
+                "buy_offset": 2,
+                "sell_offset": 3,
+                "limit": 20,
+                "inventory_skew": 0.08,
+                "close_flatten_ts": 195000,
+            },
         }
 
     def run(self, state: TradingState):
-        trader_data = json.loads(state.traderData) if state.traderData else {}
+        data = json.loads(state.traderData) if state.traderData else {}
         orders: dict[Symbol, list[Order]] = {}
 
-        emerald_symbol = self.resolve_symbol(state, ["EMERALDS", "EMERALD", "TG02"])
-        tomato_symbol = self.resolve_symbol(state, ["TOMATOES", "TOMATO", "TG01"])
+        for product in ("TOMATOES", "EMERALDS"):
+            symbol = self.resolve_symbol(state, product)
+            if symbol is None or symbol not in state.order_depths:
+                continue
 
-        if emerald_symbol and emerald_symbol in state.order_depths:
-            emerald_orders = self.trade_emerald(state, emerald_symbol)
-            if emerald_orders:
-                orders[emerald_symbol] = emerald_orders
-
-        if tomato_symbol and tomato_symbol in state.order_depths:
-            tomato_orders, tomato_ema, tomato_prev_mid = self.trade_tomato(
-                state,
-                tomato_symbol,
-                trader_data.get("tomato_ema"),
-                trader_data.get("tomato_prev_mid"),
+            sym_data = data.get(product, {})
+            product_orders, next_sym_data = self.trade_threshold(
+                state=state,
+                symbol=symbol,
+                product=product,
+                sym_data=sym_data,
             )
-            trader_data["tomato_ema"] = tomato_ema
-            trader_data["tomato_prev_mid"] = tomato_prev_mid
-            if tomato_orders:
-                orders[tomato_symbol] = tomato_orders
+            data[product] = next_sym_data
+            if product_orders:
+                orders[symbol] = product_orders
 
+        trader_data = json.dumps(data, separators=(",", ":"))
         conversions = 0
-        next_trader_data = json.dumps(trader_data, separators=(",", ":"))
-        return orders, conversions, next_trader_data
+        return orders, conversions, trader_data
 
-    def resolve_symbol(self, state: TradingState, names: list[str]) -> Symbol | None:
-        name_set = set(names)
+    def resolve_symbol(self, state: TradingState, product: str) -> Symbol | None:
+        aliases = {
+            "TOMATOES": {"tomatoes", "tomato", "tg01"},
+            "EMERALDS": {"emeralds", "emerald", "tg02"},
+        }
+        targets = aliases[product]
 
         for symbol in state.order_depths.keys():
-            if symbol in name_set:
+            if symbol.lower() in targets:
                 return symbol
 
         for symbol, listing in state.listings.items():
-            product = listing["product"] if isinstance(listing, dict) else listing.product
-            if product in name_set and symbol in state.order_depths:
+            listing_product = listing["product"] if isinstance(listing, dict) else listing.product
+            if listing_product.lower() in targets and symbol in state.order_depths:
                 return symbol
 
         return None
 
-    def trade_emerald(self, state: TradingState, symbol: Symbol) -> list[Order]:
-        fair_value = 10000.0
-        return self.market_make(
-            state=state,
-            symbol=symbol,
-            fair_value=fair_value,
-            limit=self.limits["EMERALD"],
-            aggressive_edge=1.0,
-            passive_edge=1.0,
-            inventory_skew=0.20,
-        )
-
-    def trade_tomato(
+    def trade_threshold(
         self,
         state: TradingState,
         symbol: Symbol,
-        ema: float | None,
-        prev_mid: float | None,
-    ) -> tuple[list[Order], float, float]:
-        order_depth = state.order_depths[symbol]
-        best_bid, best_ask, _, _ = self.best_prices(order_depth)
-
-        if best_bid is None or best_ask is None:
-            fallback = ema if ema is not None else 5000.0
-            return [], fallback, prev_mid if prev_mid is not None else fallback
-
-        mid = (best_bid + best_ask) / 2.0
-        alpha = 0.2
-        ema = mid if ema is None else (alpha * mid + (1.0 - alpha) * ema)
-
-        # Tutorial tomato data shows short-horizon anti-momentum. Lean against the last move.
-        if prev_mid is None:
-            fair_value = ema
-        else:
-            fair_value = ema - 0.7 * (mid - prev_mid)
-
-        orders = self.market_make(
-            state=state,
-            symbol=symbol,
-            fair_value=fair_value,
-            limit=self.limits["TOMATO"],
-            aggressive_edge=1.0,
-            passive_edge=1.0,
-            inventory_skew=0.18,
-        )
-
-        return orders, ema, mid
-
-    def market_make(
-        self,
-        state: TradingState,
-        symbol: Symbol,
-        fair_value: float,
-        limit: int,
-        aggressive_edge: float,
-        passive_edge: float,
-        inventory_skew: float,
-    ) -> list[Order]:
+        product: str,
+        sym_data: dict,
+    ) -> tuple[list[Order], dict]:
+        cfg = self.params[product]
         order_depth = state.order_depths[symbol]
         best_bid, best_ask, best_bid_volume, best_ask_volume = self.best_prices(order_depth)
 
         if best_bid is None or best_ask is None:
-            return []
+            return [], sym_data
+
+        mid = (best_bid + best_ask) / 2.0
+        mids = deque(sym_data.get("mids", []), maxlen=cfg["window"])
+        mids.append(mid)
+        fair = sum(mids) / len(mids)
+
+        position = state.position.get(symbol, 0)
+        buy_capacity = cfg["limit"] - position
+        sell_capacity = cfg["limit"] + position
+        skewed_fair = fair - cfg["inventory_skew"] * position
 
         orders: list[Order] = []
-        position = state.position.get(symbol, 0)
 
-        adjusted_fair = fair_value - inventory_skew * position
+        # End-of-day risk control: aggressively flatten remaining inventory.
+        if state.timestamp >= cfg["close_flatten_ts"]:
+            if position > 0 and sell_capacity > 0:
+                qty = min(position, sell_capacity, best_bid_volume)
+                if qty > 0:
+                    orders.append(Order(symbol, best_bid, -qty))
+            elif position < 0 and buy_capacity > 0:
+                qty = min(-position, buy_capacity, -best_ask_volume)
+                if qty > 0:
+                    orders.append(Order(symbol, best_ask, qty))
 
-        buy_capacity = limit - position
-        sell_capacity = limit + position
+            next_sym_data = {"mids": list(mids)}
+            return orders, next_sym_data
 
-        # Aggressively take mispriced levels, not just top of book.
-        for ask_price, ask_volume in sorted(order_depth.sell_orders.items()):
-            if buy_capacity <= 0:
-                break
-            if ask_price <= adjusted_fair - aggressive_edge:
-                take_qty = min(buy_capacity, -ask_volume)
-                if take_qty > 0:
-                    orders.append(Order(symbol, ask_price, take_qty))
-                    buy_capacity -= take_qty
+        if buy_capacity > 0 and best_ask <= skewed_fair - cfg["buy_offset"]:
+            qty = min(buy_capacity, -best_ask_volume)
+            if qty > 0:
+                orders.append(Order(symbol, best_ask, qty))
 
-        for bid_price, bid_volume in sorted(order_depth.buy_orders.items(), reverse=True):
-            if sell_capacity <= 0:
-                break
-            if bid_price >= adjusted_fair + aggressive_edge:
-                take_qty = min(sell_capacity, bid_volume)
-                if take_qty > 0:
-                    orders.append(Order(symbol, bid_price, -take_qty))
-                    sell_capacity -= take_qty
+        if sell_capacity > 0 and best_bid >= skewed_fair + cfg["sell_offset"]:
+            qty = min(sell_capacity, best_bid_volume)
+            if qty > 0:
+                orders.append(Order(symbol, best_bid, -qty))
 
-        # If we are glued to limits, force partial liquidation so we can quote both sides again.
-        if position >= int(0.8 * limit) and sell_capacity > 0:
-            extra = max(1, sell_capacity // 2)
-            orders.append(Order(symbol, max(best_bid, int(round(adjusted_fair))), -extra))
-            sell_capacity -= extra
-        elif position <= -int(0.8 * limit) and buy_capacity > 0:
-            extra = max(1, buy_capacity // 2)
-            orders.append(Order(symbol, min(best_ask, int(round(adjusted_fair))), extra))
-            buy_capacity -= extra
+        next_sym_data = {"mids": list(mids)}
+        return orders, next_sym_data
 
-        bid_quote = min(int(round(adjusted_fair - passive_edge)), best_bid + 1)
-        ask_quote = max(int(round(adjusted_fair + passive_edge)), best_ask - 1)
-
-        if bid_quote >= ask_quote:
-            bid_quote = int(round(adjusted_fair - 1))
-            ask_quote = int(round(adjusted_fair + 1))
-
-        if buy_capacity > 0:
-            orders.append(Order(symbol, bid_quote, buy_capacity))
-
-        if sell_capacity > 0:
-            orders.append(Order(symbol, ask_quote, -sell_capacity))
-
-        return orders
-
-    def best_prices(self, order_depth: OrderDepth):
-        if len(order_depth.buy_orders) == 0 or len(order_depth.sell_orders) == 0:
+    def best_prices(self, order_depth):
+        if not order_depth.buy_orders or not order_depth.sell_orders:
             return None, None, None, None
 
         best_bid = max(order_depth.buy_orders.keys())
         best_ask = min(order_depth.sell_orders.keys())
         best_bid_volume = order_depth.buy_orders[best_bid]
         best_ask_volume = order_depth.sell_orders[best_ask]
-
         return best_bid, best_ask, best_bid_volume, best_ask_volume
